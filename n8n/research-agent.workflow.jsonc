@@ -1,1 +1,1 @@
-// Purpose: Define the single n8n workflow that drives the simplified research-agent session from query to final answer.
+// Purpose: Define the n8n workflow that runs research steps and posts progress updates back to the FastAPI webhook.

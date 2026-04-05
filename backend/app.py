@@ -1,1 +1,1 @@
-"""Purpose: Expose the small FastAPI app and core routes for the take-home research agent."""
+"""Purpose: Expose the FastAPI app, session endpoints, webhook receiver, and live update stream for the research agent."""

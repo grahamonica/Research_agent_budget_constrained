@@ -18,9 +18,10 @@ The user should be able to see the agent narrow the search space, retain grounde
 
 Use:
 
-- **one small backend**
-- **one n8n workflow**
-- **one frontend dashboard page**
+- **one FastAPI backend**
+- **one React frontend**
+- **one n8n orchestration workflow**
+- **one webhook-driven live update flow**
 
 Do not split the system into many services, many route files, or many memory layers unless the implementation actually needs that complexity.
 
@@ -60,6 +61,20 @@ Everything else should stay local:
 - budget tracking
 
 This keeps the project aligned with the goal without overbuilding it.
+
+---
+
+## Runtime Architecture
+
+The system should connect like this:
+
+1. the React frontend starts a research session
+2. the FastAPI backend creates the session and returns a `session_id`
+3. the FastAPI backend triggers the n8n workflow for that session
+4. each n8n workflow step posts progress back into a FastAPI webhook
+5. FastAPI publishes those updates to the frontend through a live session stream
+
+This keeps the frontend simple while still making the research process visible in real time.
 
 ---
 
@@ -118,7 +133,7 @@ The point is to show **bounded retained memory**, not to build a full memory fra
 
 ## Budget Strategy
 
-Use a budget of $0.05 max per session**
+Use a budget of `$0.05` max per session.
 
 Track:
 
@@ -168,20 +183,20 @@ Chunk nodes do not need to appear in the default UI. They can stay internal unle
 
 ## n8n Workflow
 
-1. receive query from webhook
-2. initialize session and budget
-3. call backend to plan subquestions
-4. loop through subquestions
-5. call backend to retrieve and extract findings
-6. update graph and timeline state
-7. call backend to synthesize final answer
-8. return final session payload
+n8n is the required orchestration layer for this project. It should stay lightweight:
+
+1. receive a new session trigger from FastAPI
+2. run the research steps in order
+3. send progress updates to a FastAPI webhook
+4. send a final completion update when synthesis is done
+
+The FastAPI backend remains the system of record for session state, graph state, budget state, and frontend updates.
 
 ---
 
 ## Frontend
 
-The frontend contains a dashboard view.
+The frontend is a React dashboard.
 
 ### Main regions
 
@@ -189,6 +204,10 @@ The frontend contains a dashboard view.
 - **Graph**: main visual state
 - **Side panel**: selected node details and final answer and budget tracker
 - **Event log**: simple execution timeline
+
+The frontend should subscribe to a live session stream so the graph, budget, and event log update as research progresses.
+
+For this project, the frontend can stay very small. It does not need a large component tree. A single `App.tsx` file plus a bootstrap file and stylesheet is enough to demonstrate the dashboard clearly.
 
 ---
 
@@ -202,16 +221,13 @@ backend/
   memory.py
   models.py
   budget.py
+  webhooks.py
+  streaming.py
 
 frontend/
-  src/app/layout.tsx
-  src/app/page.tsx
-  src/app/globals.css
-  src/components/ResearchDashboard.tsx
-  src/components/KnowledgeGraph.tsx
-  src/components/SessionPanel.tsx
-  src/components/EventLog.tsx
-  src/lib/types.ts
+  src/main.tsx
+  src/App.tsx
+  src/styles.css
 
 n8n/
   research-agent.workflow.jsonc

@@ -1,1 +1,1 @@
-<!-- Purpose: Document the single n8n workflow used to orchestrate the simplified take-home research agent. -->
+<!-- Purpose: Document the workflow that posts research progress updates into the FastAPI webhook. -->
