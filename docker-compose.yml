@@ -1,0 +1,44 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      OPEN_AI_API_KEY: ${OPEN_AI_API_KEY:-}
+      N8N_WEBHOOK_URL: http://n8n:5678/webhook/research-session
+      FASTAPI_BASE_URL: http://backend:8000
+    depends_on:
+      - n8n
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:8000
+    depends_on:
+      - backend
+
+  n8n:
+    image: n8nio/n8n:1.86.1
+    ports:
+      - "5678:5678"
+    environment:
+      OPEN_AI_API_KEY: ${OPEN_AI_API_KEY:-}
+      FASTAPI_BASE_URL: http://backend:8000
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_HOST: 0.0.0.0
+      N8N_SECURE_COOKIE: "false"
+      WEBHOOK_URL: http://localhost:5678/
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n:/workflows:ro
+    entrypoint: ["/bin/sh", "/workflows/import-workflow.sh"]
+
+volumes:
+  n8n_data:
