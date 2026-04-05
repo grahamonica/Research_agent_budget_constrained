@@ -1,1 +1,305 @@
 // Purpose: Define the n8n workflow that runs research steps and posts progress updates back to the FastAPI webhook.
+//
+// Setup:
+//   1. In n8n → Settings → Environment Variables, set:
+//        OPEN_AI_API_KEY  = your OpenAI key
+//        FASTAPI_BASE_URL = http://localhost:8000   (adjust for your deployment)
+//   2. Import this file via n8n → Workflows → Import from file.
+//   3. Activate the workflow. The webhook path will be /webhook/research-session.
+//
+// Trigger: FastAPI POSTs to http://<n8n-host>/webhook/research-session when a session is created.
+// Output:  Each stage POSTs progress to FastAPI /api/webhook/session-update.
+
+{
+  "name": "Research Agent",
+  "nodes": [
+    {
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "name": "Session Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "path": "research-session",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "a1b2c3d4-0002-4000-8000-000000000002",
+      "name": "Init Session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst cap = Number(body.budget_cap_usd) || 0.05;\nreturn [{\n  json: {\n    session_id: body.session_id,\n    query: body.query,\n    budget_cap_usd: cap,\n    max_subquestions: Number(body.max_subquestions) || 3,\n    max_papers_per_subquestion: Number(body.max_papers_per_subquestion) || 3,\n    max_chunks_per_paper: Number(body.max_chunks_per_paper) || 3,\n    openai_api_key: process.env.OPEN_AI_API_KEY || '',\n    fastapi_webhook_url: body.fastapi_webhook_url || ((process.env.FASTAPI_BASE_URL || 'http://localhost:8000') + '/api/webhook/session-update'),\n    budget_state: { cap_usd: cap, spent_usd: 0, remaining_usd: cap, estimated_next_step_usd: 0.001 }\n  }\n}];"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "name": "Post Running",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Init Session').first().json.fastapi_webhook_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ session_id: $('Init Session').first().json.session_id, status: 'running', active_stage: 'decomposing', event: { id: 'evt_start_' + Date.now().toString(36), stage: 'planning', message: 'Research session started.', created_at: new Date().toISOString() }, graph_patch: null, new_findings: [], budget: $('Init Session').first().json.budget_state, final_answer: null }) }}"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0004-4000-8000-000000000004",
+      "name": "Build Decompose Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Init Session').first().json;\nreturn [{\n  json: {\n    ...cfg,\n    openai_payload: {\n      model: 'gpt-4o',\n      messages: [\n        { role: 'system', content: 'Break the research question into ' + cfg.max_subquestions + ' focused subquestions. Return ONLY a JSON array of strings, no other text.' },\n        { role: 'user', content: cfg.query }\n      ],\n      max_tokens: 300,\n      temperature: 0.3\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0005-4000-8000-000000000005",
+      "name": "Decompose Query",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Build Decompose Request').first().json.openai_api_key }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($('Build Decompose Request').first().json.openai_payload) }}"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0006-4000-8000-000000000006",
+      "name": "Parse Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Build Decompose Request').first().json;\nconst resp = $('Decompose Query').first().json;\nconst content = resp.choices[0].message.content;\nconst usage = resp.usage || {};\nconst cost = (usage.prompt_tokens || 0) * 2.5e-6 + (usage.completion_tokens || 0) * 10e-6;\nconst spent = cfg.budget_state.spent_usd + cost;\n\nlet subquestions;\ntry {\n  subquestions = JSON.parse(content);\n  if (!Array.isArray(subquestions)) throw new Error();\n} catch(e) {\n  subquestions = [cfg.query];\n}\nsubquestions = subquestions.slice(0, cfg.max_subquestions).map(String);\n\nconst nodes = [\n  { id: 'q_0', label: cfg.query.substring(0, 60), type: 'query', status: 'completed', score: null, metadata: {} },\n  ...subquestions.map((sq, i) => ({ id: 'sq_' + i, label: sq.substring(0, 60), type: 'subquestion', status: 'idle', score: null, metadata: {} }))\n];\nconst edges = subquestions.map((_, i) => ({ id: 'e_q_sq_' + i, source: 'q_0', target: 'sq_' + i, type: 'decomposes_to', weight: null }));\n\nconst budgetState = { cap_usd: cfg.budget_state.cap_usd, spent_usd: Math.round(spent * 1e6) / 1e6, remaining_usd: Math.round(Math.max(0, cfg.budget_state.cap_usd - spent) * 1e6) / 1e6, estimated_next_step_usd: 0.003 };\n\nconst fastapi_payload = {\n  session_id: cfg.session_id,\n  status: 'running',\n  active_stage: 'planning',\n  event: { id: 'evt_plan_' + Date.now().toString(36), stage: 'planning', message: 'Query decomposed into ' + subquestions.length + ' subquestions.', created_at: new Date().toISOString() },\n  graph_patch: { nodes, edges },\n  new_findings: [],\n  budget: budgetState,\n  final_answer: null\n};\n\nreturn [{ json: { ...cfg, subquestions, budget_state: budgetState, fastapi_payload } }];"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0007-4000-8000-000000000007",
+      "name": "Post Planning Update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Parse Plan').first().json.fastapi_webhook_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($('Parse Plan').first().json.fastapi_payload) }}"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0008-4000-8000-000000000008",
+      "name": "Build Retrieve Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Parse Plan').first().json;\nconst CORPUS = [\n  { id: 'paper_001', title: 'Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks', abstract: 'RAG models combine parametric memory with non-parametric memory. They retrieve documents with a dense passage retriever and attend over them in generation, achieving state-of-the-art on knowledge-intensive NLP tasks.' },\n  { id: 'paper_002', title: 'Limitations of Retrieval-Augmented Generation Systems', abstract: 'Key limitations of RAG include retrieval noise, context window constraints, hallucination from irrelevant context, and latency trade-offs. Noisy retrieved passages degrade generation quality significantly.' },\n  { id: 'paper_003', title: 'Chain-of-Thought Prompting for Complex Reasoning', abstract: 'Chain-of-thought prompting enables LLMs to perform complex reasoning by generating intermediate steps, substantially improving performance on arithmetic, commonsense, and symbolic reasoning.' },\n  { id: 'paper_004', title: 'Dense Passage Retrieval for Open-Domain Question Answering', abstract: 'DPR uses bi-encoder BERT models and outperforms BM25 on multiple QA benchmarks, enabling efficient large-scale retrieval with FAISS approximate nearest neighbor search.' },\n  { id: 'paper_005', title: 'Hallucination in Large Language Models: Survey and Mitigation', abstract: 'Survey of hallucination in LLMs covering intrinsic and extrinsic types. Mitigation includes retrieval augmentation, constrained decoding, and factuality-aware fine-tuning.' },\n  { id: 'paper_006', title: 'REALM: Retrieval-Enhanced Language Model Pre-Training', abstract: 'REALM augments LM pre-training with a jointly trained knowledge retriever that fetches relevant documents during pre-training and fine-tuning.' },\n  { id: 'paper_007', title: 'Budget-Constrained Inference with Adaptive Computation', abstract: 'Adaptive computation strategies for inference under cost constraints: early exit, dynamic depth selection, and retrieval throttling maintain accuracy while reducing cost by 40%.' },\n  { id: 'paper_008', title: 'Knowledge Graphs for Enhanced Retrieval-Augmented Systems', abstract: 'Integrating structured knowledge graphs with RAG improves multi-hop reasoning by providing explicit entity-relation links that guide retrieval and reduce hallucination.' }\n];\nconst corpusText = CORPUS.map(p => '[' + p.id + '] ' + p.title + '\\n' + p.abstract).join('\\n\\n');\nconst sqList = cfg.subquestions.map((sq, i) => 'sq_' + i + ': ' + sq).join('\\n');\n\nreturn [{\n  json: {\n    ...cfg,\n    openai_payload: {\n      model: 'gpt-4o',\n      messages: [\n        { role: 'system', content: 'You are a research assistant. Given subquestions and a paper corpus, select the most relevant papers for each subquestion and extract 1-2 factual findings per subquestion. Return JSON: {\"retrieved\": [{\"subquestion_id\": \"sq_N\", \"papers\": [{\"id\": \"paper_XXX\", \"title\": \"...\", \"score\": 0.9}], \"findings\": [{\"id\": \"f_sq_N_0\", \"subquestion_id\": \"sq_N\", \"claim\": \"...\", \"source_ids\": [\"paper_XXX\"], \"confidence\": 0.85, \"created_at\": \"<ISO>\"}]}]}' },\n        { role: 'user', content: 'Subquestions:\\n' + sqList + '\\n\\nCorpus:\\n' + corpusText }\n      ],\n      max_tokens: 1500,\n      temperature: 0.3\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0009-4000-8000-000000000009",
+      "name": "Retrieve and Extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Build Retrieve Request').first().json.openai_api_key }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($('Build Retrieve Request').first().json.openai_payload) }}"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0010-4000-8000-000000000010",
+      "name": "Parse Findings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Build Retrieve Request').first().json;\nconst resp = $('Retrieve and Extract').first().json;\nconst content = resp.choices[0].message.content;\nconst usage = resp.usage || {};\nconst cost = (usage.prompt_tokens || 0) * 2.5e-6 + (usage.completion_tokens || 0) * 10e-6;\nconst spent = cfg.budget_state.spent_usd + cost;\n\nlet retrieved = [];\ntry {\n  const parsed = JSON.parse(content);\n  retrieved = parsed.retrieved || [];\n} catch(e) { retrieved = []; }\n\nconst paperNodes = [], paperEdges = [], findingNodes = [], findingEdges = [], allFindings = [];\n\nfor (const item of retrieved) {\n  const sqId = item.subquestion_id;\n  paperNodes.push({ id: sqId, label: (cfg.subquestions[parseInt(sqId.replace('sq_', ''))] || sqId).substring(0, 60), type: 'subquestion', status: 'completed', score: null, metadata: {} });\n  for (const paper of (item.papers || [])) {\n    paperNodes.push({ id: paper.id, label: (paper.title || paper.id).substring(0, 60), type: 'paper', status: 'completed', score: paper.score || 0.7, metadata: { title: paper.title } });\n    paperEdges.push({ id: 'e_' + sqId + '_' + paper.id, source: sqId, target: paper.id, type: 'retrieves', weight: paper.score || null });\n  }\n  for (const finding of (item.findings || [])) {\n    const now = new Date().toISOString();\n    const f = { id: finding.id || ('f_' + sqId + '_' + Date.now().toString(36)), subquestion_id: finding.subquestion_id || sqId, claim: finding.claim || '', source_ids: finding.source_ids || [], confidence: Number(finding.confidence) || 0.7, created_at: finding.created_at || now };\n    allFindings.push(f);\n    findingNodes.push({ id: f.id, label: f.claim.substring(0, 60), type: 'finding', status: 'completed', score: f.confidence, metadata: {} });\n    if (f.source_ids.length > 0) {\n      findingEdges.push({ id: 'e_' + f.source_ids[0] + '_' + f.id, source: f.source_ids[0], target: f.id, type: 'supports', weight: f.confidence });\n    }\n  }\n}\n\nconst budgetState = { cap_usd: cfg.budget_state.cap_usd, spent_usd: Math.round(spent * 1e6) / 1e6, remaining_usd: Math.round(Math.max(0, cfg.budget_state.cap_usd - spent) * 1e6) / 1e6, estimated_next_step_usd: 0.005 };\n\nconst fastapi_payload = {\n  session_id: cfg.session_id,\n  status: 'running',\n  active_stage: 'extracting',\n  event: { id: 'evt_ret_' + Date.now().toString(36), stage: 'retrieval', message: 'Retrieved papers and extracted ' + allFindings.length + ' findings.', created_at: new Date().toISOString() },\n  graph_patch: { nodes: [...paperNodes, ...findingNodes], edges: [...paperEdges, ...findingEdges] },\n  new_findings: allFindings,\n  budget: budgetState,\n  final_answer: null\n};\n\nreturn [{ json: { ...cfg, budget_state: budgetState, findings: allFindings, fastapi_payload } }];"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0011-4000-8000-000000000011",
+      "name": "Post Findings Update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Parse Findings').first().json.fastapi_webhook_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($('Parse Findings').first().json.fastapi_payload) }}"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0012-4000-8000-000000000012",
+      "name": "Build Synthesize Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Parse Findings').first().json;\nconst findingsText = cfg.findings.map(f => '- [' + f.confidence.toFixed(2) + '] ' + f.claim).join('\\n');\nreturn [{\n  json: {\n    ...cfg,\n    openai_payload: {\n      model: 'gpt-4o',\n      messages: [\n        { role: 'system', content: 'Synthesize a concise research answer grounded in the provided findings. Return JSON: {\"text\": \"...\", \"citations\": [\"finding_id\", ...], \"uncertainty\": \"low|medium|high\"}' },\n        { role: 'user', content: 'Research Question: ' + cfg.query + '\\n\\nFindings:\\n' + findingsText }\n      ],\n      max_tokens: 600,\n      temperature: 0.3\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0013-4000-8000-000000000013",
+      "name": "Synthesize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2880, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Build Synthesize Request').first().json.openai_api_key }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($('Build Synthesize Request').first().json.openai_payload) }}"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0014-4000-8000-000000000014",
+      "name": "Parse Complete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Build Synthesize Request').first().json;\nconst resp = $('Synthesize').first().json;\nconst content = resp.choices[0].message.content;\nconst usage = resp.usage || {};\nconst cost = (usage.prompt_tokens || 0) * 2.5e-6 + (usage.completion_tokens || 0) * 10e-6;\nconst spent = cfg.budget_state.spent_usd + cost;\n\nlet finalAnswer;\ntry {\n  const parsed = JSON.parse(content);\n  finalAnswer = { text: parsed.text || content, citations: parsed.citations || cfg.findings.map(f => f.id), uncertainty: parsed.uncertainty || 'medium' };\n} catch(e) {\n  finalAnswer = { text: content, citations: cfg.findings.map(f => f.id), uncertainty: 'medium' };\n}\n\nconst budgetState = { cap_usd: cfg.budget_state.cap_usd, spent_usd: Math.round(spent * 1e6) / 1e6, remaining_usd: Math.round(Math.max(0, cfg.budget_state.cap_usd - spent) * 1e6) / 1e6, estimated_next_step_usd: 0 };\n\nconst finalNode = { id: 'final_0', label: 'Final Answer', type: 'final', status: 'completed', score: null, metadata: {} };\nconst finalEdges = cfg.findings.slice(0, 5).map(f => ({ id: 'e_' + f.id + '_final', source: f.id, target: 'final_0', type: 'supports', weight: f.confidence }));\n\nconst fastapi_payload = {\n  session_id: cfg.session_id,\n  status: 'completed',\n  active_stage: 'completed',\n  event: { id: 'evt_done_' + Date.now().toString(36), stage: 'synthesis', message: 'Research complete. Final answer synthesized.', created_at: new Date().toISOString() },\n  graph_patch: { nodes: [finalNode], edges: finalEdges },\n  new_findings: [],\n  budget: budgetState,\n  final_answer: finalAnswer\n};\n\nreturn [{ json: { fastapi_webhook_url: cfg.fastapi_webhook_url, fastapi_payload } }];"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0015-4000-8000-000000000015",
+      "name": "Post Completion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3320, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Parse Complete').first().json.fastapi_webhook_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($('Parse Complete').first().json.fastapi_payload) }}"
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Session Trigger": {
+      "main": [[{ "node": "Init Session", "type": "main", "index": 0 }]]
+    },
+    "Init Session": {
+      "main": [[{ "node": "Post Running", "type": "main", "index": 0 }]]
+    },
+    "Post Running": {
+      "main": [[{ "node": "Build Decompose Request", "type": "main", "index": 0 }]]
+    },
+    "Build Decompose Request": {
+      "main": [[{ "node": "Decompose Query", "type": "main", "index": 0 }]]
+    },
+    "Decompose Query": {
+      "main": [[{ "node": "Parse Plan", "type": "main", "index": 0 }]]
+    },
+    "Parse Plan": {
+      "main": [[{ "node": "Post Planning Update", "type": "main", "index": 0 }]]
+    },
+    "Post Planning Update": {
+      "main": [[{ "node": "Build Retrieve Request", "type": "main", "index": 0 }]]
+    },
+    "Build Retrieve Request": {
+      "main": [[{ "node": "Retrieve and Extract", "type": "main", "index": 0 }]]
+    },
+    "Retrieve and Extract": {
+      "main": [[{ "node": "Parse Findings", "type": "main", "index": 0 }]]
+    },
+    "Parse Findings": {
+      "main": [[{ "node": "Post Findings Update", "type": "main", "index": 0 }]]
+    },
+    "Post Findings Update": {
+      "main": [[{ "node": "Build Synthesize Request", "type": "main", "index": 0 }]]
+    },
+    "Build Synthesize Request": {
+      "main": [[{ "node": "Synthesize", "type": "main", "index": 0 }]]
+    },
+    "Synthesize": {
+      "main": [[{ "node": "Parse Complete", "type": "main", "index": 0 }]]
+    },
+    "Parse Complete": {
+      "main": [[{ "node": "Post Completion", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "a1b2c3d4-ffff-4000-8000-000000000000",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "local"
+  },
+  "id": "research-agent-workflow-001",
+  "tags": []
+}
