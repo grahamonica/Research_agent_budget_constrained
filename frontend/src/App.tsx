@@ -98,6 +98,7 @@ const TYPE_ORDER: GraphNodeType[] = [
 ];
 
 type Pos = { x: number; y: number };
+type Bounds = { minX: number; minY: number; maxX: number; maxY: number };
 const NODE_COLOR: Record<GraphNodeType, string> = {
   query: "#20374d",
   subquestion: "#4f3d7a",
@@ -125,18 +126,57 @@ export function buildGraphLevels(graph: GraphSnapshot): GraphNode[][] {
     .filter((level) => level.length > 0);
 }
 
+function normalizeAngle(angle: number): number {
+  while (angle <= -Math.PI) angle += Math.PI * 2;
+  while (angle > Math.PI) angle -= Math.PI * 2;
+  return angle;
+}
+
+function averageAngles(angles: number[]): number {
+  if (angles.length === 0) return 0;
+  const x = angles.reduce((sum, angle) => sum + Math.cos(angle), 0);
+  const y = angles.reduce((sum, angle) => sum + Math.sin(angle), 0);
+  return Math.atan2(y, x);
+}
+
+function measureBounds(positions: Map<string, Pos>): Bounds {
+  const values = [...positions.values()];
+  if (values.length === 0) {
+    return { minX: 0, minY: 0, maxX: 480, maxY: 480 };
+  }
+
+  return values.reduce<Bounds>(
+    (acc, pos) => ({
+      minX: Math.min(acc.minX, pos.x),
+      minY: Math.min(acc.minY, pos.y),
+      maxX: Math.max(acc.maxX, pos.x + NODE_W),
+      maxY: Math.max(acc.maxY, pos.y + NODE_H),
+    }),
+    {
+      minX: values[0].x,
+      minY: values[0].y,
+      maxX: values[0].x + NODE_W,
+      maxY: values[0].y + NODE_H,
+    },
+  );
+}
 
 function computeLayout(nodes: GraphNode[], edges: GraphEdge[]) {
   if (nodes.length === 0) {
-    return { positions: new Map<string, Pos>(), svgW: 480, svgH: 480 };
+    return {
+      positions: new Map<string, Pos>(),
+      bounds: { minX: 0, minY: 0, maxX: 480, maxY: 480 },
+    };
   }
 
   // Radial ring layout: query at center, each node type on its own ring.
   const R_SQ    = 130;  // subquestion ring
   const R_CAT   = 185;  // category ring (rarely used)
   const R_PAPER = 248;  // paper ring
-  const R_FIND  = 358;  // finding ring
+  const R_FIND  = 430;  // finding ring
   const R_FINAL = 78;   // final answer: small offset from center (below)
+  const PAPER_MAX_RADIUS = R_FIND - 118;
+  const FINDING_MIN_RADIUS = R_PAPER + 118;
 
   const MARGIN = NODE_W / 2 + 28;
   const CX = R_FIND + MARGIN;  // ≈ 468
@@ -150,16 +190,44 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]) {
     parents.set(edge.target, [...(parents.get(edge.target) ?? []), edge.source]);
   });
 
+  const anchors = new Map<string, Pos>();
+
   const place = (id: string, angle: number, r: number) => {
     positions.set(id, {
       x: CX + r * Math.cos(angle) - NODE_W / 2,
       y: CY + r * Math.sin(angle) - NODE_H / 2,
     });
+    anchors.set(id, {
+      x: CX + r * Math.cos(angle) - NODE_W / 2,
+      y: CY + r * Math.sin(angle) - NODE_H / 2,
+    });
+  };
+
+  const clampNodeRadius = (node: GraphNode, pos: Pos) => {
+    const centerX = pos.x + NODE_W / 2;
+    const centerY = pos.y + NODE_H / 2;
+    const dx = centerX - CX;
+    const dy = centerY - CY;
+    const radius = Math.hypot(dx, dy) || 1;
+    let targetRadius = radius;
+
+    if (node.type === "paper") {
+      targetRadius = Math.min(radius, PAPER_MAX_RADIUS);
+    } else if (node.type === "finding") {
+      targetRadius = Math.max(radius, FINDING_MIN_RADIUS);
+    }
+
+    if (targetRadius === radius) return;
+    const scale = targetRadius / radius;
+    pos.x = CX + dx * scale - NODE_W / 2;
+    pos.y = CY + dy * scale - NODE_H / 2;
   };
 
   // Query: center
   nodes.filter((n) => n.type === "query").forEach((n) => {
-    positions.set(n.id, { x: CX - NODE_W / 2, y: CY - NODE_H / 2 });
+    const pos = { x: CX - NODE_W / 2, y: CY - NODE_H / 2 };
+    positions.set(n.id, pos);
+    anchors.set(n.id, pos);
   });
 
   // Final: below center at R_FINAL (angle = π/2)
@@ -188,7 +256,7 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]) {
     place(n.id, angle, R_CAT);
   });
 
-  // Papers: grouped by parent sq, fanned around parent angle
+  // Papers: grouped by parent sq, with shared papers allowed to spread farther from crowded parent angles.
   const paperNodes = nodes.filter((n) => n.type === "paper");
   const papersBySq = new Map<string, GraphNode[]>();
   paperNodes.forEach((n) => {
@@ -202,8 +270,21 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]) {
     const base = sqAngles.get(sqId) ?? catAngles.get(sqId) ?? 0;
     const span = Math.min(0.52, papers.length * 0.19);
     papers.forEach((n, i) => {
-      const offset = papers.length > 1 ? (i / (papers.length - 1) - 0.5) * 2 * span : 0;
-      place(n.id, base + offset, R_PAPER);
+      const parentAngles = (parents.get(n.id) ?? [])
+        .map((pid) => sqAngles.get(pid) ?? catAngles.get(pid))
+        .filter((angle): angle is number => typeof angle === "number");
+      const sharedCount = Math.max(parentAngles.length - 1, 0);
+      const anchorAngle = parentAngles.length > 0 ? averageAngles(parentAngles) : base;
+      const fanOffset = papers.length > 1 ? (i / (papers.length - 1) - 0.5) * 2 * span : 0;
+      const sharedSpread =
+        sharedCount > 0
+          ? normalizeAngle(base - anchorAngle) * 0.7 + (sharedCount % 2 === 0 ? -1 : 1) * 0.18 * sharedCount
+          : 0;
+      const radius = Math.min(
+        PAPER_MAX_RADIUS,
+        R_PAPER + sharedCount * 42 + Math.abs(fanOffset + sharedSpread) * 34,
+      );
+      place(n.id, anchorAngle + fanOffset + sharedSpread, radius);
     });
   });
 
@@ -223,19 +304,63 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]) {
     const span = Math.min(0.40, findings.length * 0.15);
     findings.forEach((n, i) => {
       const offset = findings.length > 1 ? (i / (findings.length - 1) - 0.5) * 2 * span : 0;
-      place(n.id, base + offset, R_FIND);
+      place(n.id, base + offset, Math.max(R_FIND, FINDING_MIN_RADIUS));
     });
   });
 
   // Fallback for any unpositioned nodes
   nodes.forEach((n) => {
     if (!positions.has(n.id)) {
-      positions.set(n.id, { x: CX - NODE_W / 2, y: CY + R_FIND + 20 });
+      const pos = { x: CX - NODE_W / 2, y: CY + R_FIND + 20 };
+      positions.set(n.id, pos);
+      anchors.set(n.id, pos);
     }
   });
 
-  const svgSize = CX * 2;
-  return { positions, svgW: svgSize, svgH: svgSize };
+  // Relax non-central nodes so crowded clusters can spread without losing their general ring placement.
+  const movableNodes = nodes.filter((node) => node.type !== "query" && node.type !== "final");
+  const minGapX = NODE_W + 24;
+  const minGapY = NODE_H + 18;
+  for (let iteration = 0; iteration < 28; iteration += 1) {
+    for (let i = 0; i < movableNodes.length; i += 1) {
+      const left = movableNodes[i];
+      const leftPos = positions.get(left.id);
+      if (!leftPos) continue;
+
+      for (let j = i + 1; j < movableNodes.length; j += 1) {
+        const right = movableNodes[j];
+        const rightPos = positions.get(right.id);
+        if (!rightPos) continue;
+
+        const dx = (leftPos.x + NODE_W / 2) - (rightPos.x + NODE_W / 2);
+        const dy = (leftPos.y + NODE_H / 2) - (rightPos.y + NODE_H / 2);
+        const overlapX = minGapX - Math.abs(dx);
+        const overlapY = minGapY - Math.abs(dy);
+        if (overlapX <= 0 || overlapY <= 0) continue;
+
+        const push = Math.max(overlapX, overlapY) * 0.1 + 1.2;
+        const dist = Math.hypot(dx, dy) || 1;
+        const pushX = (dx / dist) * push;
+        const pushY = (dy / dist) * push;
+        leftPos.x += pushX;
+        leftPos.y += pushY;
+        rightPos.x -= pushX;
+        rightPos.y -= pushY;
+      }
+    }
+
+    movableNodes.forEach((node) => {
+      const pos = positions.get(node.id);
+      const anchor = anchors.get(node.id);
+      if (!pos || !anchor) return;
+      pos.x += (anchor.x - pos.x) * 0.08;
+      pos.y += (anchor.y - pos.y) * 0.08;
+      clampNodeRadius(node, pos);
+    });
+  }
+
+  const bounds = measureBounds(positions);
+  return { positions, bounds };
 }
 
 function GraphCanvas({
@@ -247,30 +372,51 @@ function GraphCanvas({
   selectedId: string | null;
   onSelect: (id: string) => void;
 }) {
-  const { positions, svgW, svgH } = useMemo(
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [isGraphReady, setIsGraphReady] = useState(false);
+  const { positions, bounds } = useMemo(
     () => computeLayout(graph.nodes, graph.edges),
     [graph.nodes, graph.edges],
   );
+  const paddedViewBox = useMemo(() => {
+    const padding = 72;
+    const minX = bounds.minX - padding;
+    const minY = bounds.minY - padding;
+    const width = Math.max(bounds.maxX - bounds.minX, NODE_W) + padding * 2;
+    const height = Math.max(bounds.maxY - bounds.minY, NODE_H) + padding * 2;
+    return { minX, minY, width, height };
+  }, [bounds]);
+
+  useEffect(() => {
+    setIsGraphReady(false);
+    const timer = window.setTimeout(() => setIsGraphReady(true), 18);
+    return () => window.clearTimeout(timer);
+  }, [paddedViewBox.height, paddedViewBox.minX, paddedViewBox.minY, paddedViewBox.width]);
 
   if (graph.nodes.length === 0) {
     return (
-      <div className="graph-empty">
+      <div ref={containerRef} className="graph-empty">
         <p>The research network will grow here as the run explores and prunes branches.</p>
       </div>
     );
   }
 
   return (
-    <svg width={svgW} height={svgH} viewBox={`0 0 ${svgW} ${svgH}`} className="graph-svg">
+    <div ref={containerRef} className="graph-viewport">
+      <svg
+        width="100%"
+        height="100%"
+        viewBox={`${paddedViewBox.minX} ${paddedViewBox.minY} ${paddedViewBox.width} ${paddedViewBox.height}`}
+        preserveAspectRatio="xMidYMid meet"
+        className={`graph-svg ${isGraphReady ? "graph-svg-ready" : ""}`}
+      >
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-          <path d="M0,0 L0,8 L8,4 z" fill="rgba(73,63,52,0.30)" />
-        </marker>
-        <marker id="arrow-hi" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-          <path d="M0,0 L0,8 L8,4 z" fill="rgba(47,38,29,0.66)" />
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0 L0,8 L8,4 z" fill="context-stroke" />
         </marker>
       </defs>
 
+      <g className="edge-layer" aria-hidden="true">
       {graph.edges.map((edge) => {
         const source = positions.get(edge.source);
         const target = positions.get(edge.target);
@@ -294,35 +440,38 @@ function GraphCanvas({
         const tX = (NODE_W / 2) / (Math.abs(cos) + 0.001);
         const tY = (NODE_H / 2) / (Math.abs(sin) + 0.001);
         const t = Math.min(tX, tY);
-        const x1 = srcCX + cos * t;
-        const y1 = srcCY + sin * t;
-        const x2 = tgtCX - cos * t;
-        const y2 = tgtCY - sin * t;
+        const isMostlyVertical = Math.abs(dy) > Math.abs(dx) * 1.35;
+        const startLift = isMostlyVertical && dy > 0 ? 10 : 0;
+        const arrowInset = isMostlyVertical ? 6 : 12;
+        const x1 = srcCX + cos * Math.max(t - startLift, 0);
+        const y1 = srcCY + sin * Math.max(t - startLift, 0);
+        const x2 = tgtCX - cos * (t + arrowInset);
+        const y2 = tgtCY - sin * (t + arrowInset);
         const dist = Math.sqrt(dx * dx + dy * dy);
         const ctrl = dist * 0.32;
         const cp1x = x1 + cos * ctrl;
         const cp1y = y1 + sin * ctrl;
         const cp2x = x2 - cos * ctrl;
         const cp2y = y2 - sin * ctrl;
+        const edgeColor = isDiscarded
+          ? "rgba(140,129,117,0.16)"
+          : isHighlighted
+            ? "rgba(47,38,29,0.62)"
+            : "rgba(95,84,71,0.22)";
 
         return (
           <path
             key={edge.id}
             d={`M ${x1} ${y1} C ${cp1x} ${cp1y} ${cp2x} ${cp2y} ${x2} ${y2}`}
             fill="none"
-            stroke={
-              isDiscarded
-                ? "rgba(140,129,117,0.16)"
-                : isHighlighted
-                  ? "rgba(47,38,29,0.62)"
-                  : "rgba(95,84,71,0.22)"
-            }
+            stroke={edgeColor}
             strokeWidth={isHighlighted ? 2.2 : 1.5}
             strokeDasharray={isDiscarded ? "5 5" : undefined}
-            markerEnd={isHighlighted ? "url(#arrow-hi)" : "url(#arrow)"}
+            markerEnd="url(#arrow)"
           />
         );
       })}
+      </g>
 
       {graph.nodes.map((node) => {
         const pos = positions.get(node.id);
@@ -362,7 +511,7 @@ function GraphCanvas({
                 width={NODE_W + 8}
                 height={NODE_H + 8}
                 rx={15}
-                fill={`${color}18`}
+                fill="#f8f4ec"
                 stroke={color}
                 strokeOpacity={0.84}
                 strokeWidth={2.6}
@@ -375,7 +524,7 @@ function GraphCanvas({
               width={NODE_W}
               height={NODE_H}
               rx={12}
-              fill={`${color}12`}
+              fill="#fbf8f2"
               stroke={color}
               strokeWidth={node.status === "active" ? 1.9 : 1.45}
               strokeOpacity={node.status === "completed" ? 0.62 : node.status === "active" ? 0.88 : 0.42}
@@ -434,6 +583,7 @@ function GraphCanvas({
         );
       })}
     </svg>
+    </div>
   );
 }
 

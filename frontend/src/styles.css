@@ -345,13 +345,30 @@ button, input, textarea {
 .graph-canvas {
   overflow: auto;
   padding: 28px;
+  min-height: 480px;
   background:
     radial-gradient(circle at 50% 20%, rgba(255, 255, 255, 0.26), transparent 32%),
     rgba(243, 238, 228, 0.42);
 }
 
+.graph-viewport {
+  min-width: 100%;
+  min-height: 480px;
+}
+
 .graph-svg {
   display: block;
+  min-height: 480px;
+  opacity: 0.01;
+  transition: opacity 320ms ease;
+}
+
+.graph-svg-ready {
+  opacity: 1;
+}
+
+.edge-layer {
+  pointer-events: none;
 }
 
 .node-pulse-ring {
