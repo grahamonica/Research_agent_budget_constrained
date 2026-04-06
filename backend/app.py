@@ -17,6 +17,7 @@ from .models import (
     CreateSessionRequest,
     CreateSessionResponse,
     GraphSnapshot,
+    ResearchSettings,
     SessionSnapshot,
     SessionUpdateEvent,
     WebhookUpdateRequest,
@@ -44,6 +45,25 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def _trigger_n8n_session(snapshot: SessionSnapshot) -> None:
+    payload = {
+        "session_id": snapshot.session_id,
+        "query": snapshot.query,
+        "budget_cap_usd": snapshot.budget.cap_usd,
+        "max_subquestions": snapshot.settings.max_subquestions,
+        "max_papers_per_subquestion": snapshot.settings.max_papers_per_subquestion,
+        "max_chunks_per_paper": snapshot.settings.max_chunks_per_paper,
+        "fastapi_webhook_url": f"{FASTAPI_BASE_URL.rstrip('/')}/api/webhook/session-update",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            N8N_WEBHOOK_URL,
+            json=payload,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.post("/api/session", response_model=CreateSessionResponse)
@@ -60,12 +80,21 @@ async def create_session(body: CreateSessionRequest) -> CreateSessionResponse:
             remaining_usd=body.budget_cap_usd,
             estimated_next_step_usd=0.0,
         ),
+        settings=ResearchSettings(
+            max_subquestions=body.max_subquestions,
+            max_papers_per_subquestion=body.max_papers_per_subquestion,
+            max_chunks_per_paper=body.max_chunks_per_paper,
+        ),
         graph=GraphSnapshot(),
         created_at=_now(),
         updated_at=_now(),
     )
     sessions[session_id] = snapshot
-    asyncio.create_task(_trigger_n8n(session_id, body))
+    try:
+        await _trigger_n8n_session(snapshot)
+    except httpx.HTTPError as exc:
+        sessions.pop(session_id, None)
+        raise HTTPException(status_code=502, detail=f"Failed to trigger n8n workflow: {exc}") from exc
     return CreateSessionResponse(
         session_id=session_id,
         status="queued",
@@ -118,27 +147,3 @@ async def webhook_session_update(body: WebhookUpdateRequest):
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return {"ok": True}
-
-
-# ── n8n trigger with local pipeline fallback ──────────────────────────────────
-
-async def _trigger_n8n(session_id: str, body: CreateSessionRequest) -> None:
-    payload = {
-        "session_id": session_id,
-        "query": body.query,
-        "budget_cap_usd": body.budget_cap_usd,
-        "max_subquestions": body.max_subquestions,
-        "max_papers_per_subquestion": body.max_papers_per_subquestion,
-        "max_chunks_per_paper": body.max_chunks_per_paper,
-        "fastapi_webhook_url": f"{FASTAPI_BASE_URL}/api/webhook/session-update",
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(N8N_WEBHOOK_URL, json=payload, timeout=10.0)
-            resp.raise_for_status()
-    except Exception:
-        # n8n unavailable — run the pipeline directly inside FastAPI
-        snap = sessions.get(session_id)
-        if snap:
-            from .pipeline import run_pipeline
-            asyncio.create_task(run_pipeline(snap, sessions, apply_webhook_update))

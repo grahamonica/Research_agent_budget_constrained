@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from typing import Any
 
 import httpx
 
 OPENAI_API_KEY = os.environ.get("OPEN_AI_API_KEY", "")
 EMBEDDING_MODEL = "text-embedding-3-small"
+TEST_MODE = os.environ.get("RESEARCH_AGENT_TEST_MODE", "").lower() in {"1", "true", "yes"}
 
 # ── Embedded corpus ────────────────────────────────────────────────────────────
 # Small set of paper summaries that covers common research topics.
@@ -144,6 +146,8 @@ CORPUS: list[dict[str, Any]] = [
 # ── Embedding helpers ──────────────────────────────────────────────────────────
 
 async def get_embeddings(texts: list[str]) -> list[list[float]]:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPEN_AI_API_KEY is required for embedding retrieval.")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.openai.com/v1/embeddings",
@@ -168,6 +172,19 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return _dot(a, b) / denom if denom > 0 else 0.0
 
 
+def _terms(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]{3,}", text.lower()))
+
+
+def lexical_overlap(query: str, text: str) -> float:
+    query_terms = _terms(query)
+    text_terms = _terms(text)
+    if not query_terms or not text_terms:
+        return 0.0
+    overlap = len(query_terms & text_terms)
+    return overlap / max(len(query_terms), 1)
+
+
 # ── Public retrieval API ───────────────────────────────────────────────────────
 
 async def retrieve_top_papers(
@@ -176,36 +193,81 @@ async def retrieve_top_papers(
     max_chunks: int,
 ) -> list[dict[str, Any]]:
     """Embed the subquestion, rank corpus papers by similarity, return top papers with chunks."""
+    if TEST_MODE:
+        scored_local = sorted(
+            (
+                (
+                    round(
+                        lexical_overlap(subquestion, f"{paper['title']} {paper['abstract']}") * 0.65
+                        + lexical_overlap(subquestion, " ".join(paper["chunks"])) * 0.35,
+                        4,
+                    ),
+                    paper,
+                )
+                for paper in CORPUS
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        results: list[dict[str, Any]] = []
+        for rank, (score, paper) in enumerate(scored_local[:max_papers], start=1):
+            ranked_chunks = sorted(
+                paper["chunks"],
+                key=lambda chunk: lexical_overlap(subquestion, chunk),
+                reverse=True,
+            )
+            top_chunks = ranked_chunks[:max_chunks]
+            results.append({
+                "id": paper["id"],
+                "title": paper["title"],
+                "score": score,
+                "rank": rank,
+                "lexical_score": round(lexical_overlap(subquestion, f"{paper['title']} {paper['abstract']}"), 4),
+                "chunks": top_chunks,
+                "chunk_scores": [round(lexical_overlap(subquestion, chunk), 4) for chunk in top_chunks],
+            })
+        return results
+
     texts = [subquestion] + [p["abstract"] for p in CORPUS]
     embeddings = await get_embeddings(texts)
     query_emb = embeddings[0]
     paper_embs = embeddings[1:]
 
-    scored = sorted(
-        zip(paper_embs, CORPUS),
-        key=lambda x: cosine_similarity(query_emb, x[0]),
-        reverse=True,
-    )
+    scored: list[tuple[float, list[float], dict[str, Any]]] = []
+    for emb, paper in zip(paper_embs, CORPUS):
+        abstract_score = cosine_similarity(query_emb, emb)
+        lexical_score = lexical_overlap(subquestion, f"{paper['title']} {paper['abstract']}")
+        hybrid_score = round((abstract_score * 0.72) + (lexical_score * 0.28), 4)
+        scored.append((hybrid_score, emb, paper))
+    scored.sort(key=lambda item: item[0], reverse=True)
 
     results: list[dict[str, Any]] = []
-    for emb, paper in scored[:max_papers]:
-        score = cosine_similarity(query_emb, emb)
+    for rank, (score, _emb, paper) in enumerate(scored[:max_papers], start=1):
         # Rank chunks by similarity to the subquestion
         if paper["chunks"]:
             chunk_embs = await get_embeddings(paper["chunks"])
             ranked_chunks = sorted(
                 zip(chunk_embs, paper["chunks"]),
-                key=lambda x: cosine_similarity(query_emb, x[0]),
+                key=lambda x: (
+                    cosine_similarity(query_emb, x[0]) * 0.78
+                    + lexical_overlap(subquestion, x[1]) * 0.22
+                ),
                 reverse=True,
             )
-            top_chunks = [ch for _, ch in ranked_chunks[:max_chunks]]
+            top_pairs = ranked_chunks[:max_chunks]
+            top_chunks = [ch for _, ch in top_pairs]
+            chunk_scores = [round(cosine_similarity(query_emb, emb), 4) for emb, _ in top_pairs]
         else:
             top_chunks = []
+            chunk_scores = []
 
         results.append({
             "id": paper["id"],
             "title": paper["title"],
-            "score": round(score, 4),
+            "score": score,
+            "rank": rank,
+            "lexical_score": round(lexical_overlap(subquestion, f"{paper['title']} {paper['abstract']}"), 4),
             "chunks": top_chunks,
+            "chunk_scores": chunk_scores,
         })
     return results

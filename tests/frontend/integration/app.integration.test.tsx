@@ -2,11 +2,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import App, {
-  CreateSessionResponse,
-  DEMO_SNAPSHOT,
-  SessionUpdateEvent,
-} from "../../../frontend/src/App";
+import App, { CreateSessionResponse, SessionUpdateEvent, SessionSnapshot } from "../../../frontend/src/App";
 
 class MockEventSource {
   static instances: MockEventSource[] = [];
@@ -31,10 +27,33 @@ class MockEventSource {
   }
 
   emitMessage(payload: SessionUpdateEvent) {
-    this.onmessage?.({
-      data: JSON.stringify(payload),
-    } as MessageEvent<string>);
+    this.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent<string>);
   }
+}
+
+function makeSnapshot(overrides: Partial<SessionSnapshot> = {}): SessionSnapshot {
+  return {
+    session_id: "sess_001",
+    query: "How should the system show pruning in the graph?",
+    status: "queued",
+    active_stage: "created",
+    budget: {
+      cap_usd: 0.1,
+      spent_usd: 0,
+      remaining_usd: 0.1,
+      estimated_next_step_usd: 0.002,
+      active_allocation_key: null,
+      allocations: [],
+    },
+    subquestions: [],
+    graph: { nodes: [], edges: [] },
+    findings: [],
+    final_answer: null,
+    events: [],
+    created_at: "2026-04-05T14:00:00Z",
+    updated_at: "2026-04-05T14:00:00Z",
+    ...overrides,
+  };
 }
 
 describe("App integration", () => {
@@ -46,42 +65,33 @@ describe("App integration", () => {
     vi.stubGlobal("EventSource", MockEventSource);
   });
 
-  it("renders the demo snapshot by default", () => {
+  it("starts empty instead of loading a demo session", () => {
     render(<App />);
 
+    expect(screen.getByRole("button", { name: /run research/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/research query/i)).toHaveValue("");
     expect(
-      screen.getByRole("heading", { name: /live research state over fastapi \+ n8n/i }),
+      screen.getByText(/run a query to watch the agent explore papers, prune weak branches, and retain findings/i),
     ).toBeInTheDocument();
-    expect(screen.getByText("demo_session")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /subquestion retrieval misses score 95%/i }),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/created 3 subquestions\./i)).toBeInTheDocument();
+    expect(screen.queryByText("demo_session")).not.toBeInTheDocument();
   });
 
   it("submits a new session request and applies live SSE updates", async () => {
-    const createdSnapshot = {
-      ...DEMO_SNAPSHOT,
-      session_id: "sess_001",
-      status: "queued" as const,
-      active_stage: "created",
+    const createdSnapshot = makeSnapshot({
       graph: {
         nodes: [
           {
-            id: "q_new",
+            id: "q_0",
             label: "Fresh query",
-            type: "query" as const,
-            status: "active" as const,
+            type: "query",
+            status: "completed",
             score: 1,
             metadata: {},
           },
         ],
         edges: [],
       },
-      events: [],
-      findings: [],
-      final_answer: null,
-    };
+    });
 
     const createResponse: CreateSessionResponse = {
       session_id: "sess_001",
@@ -90,38 +100,69 @@ describe("App integration", () => {
       snapshot: createdSnapshot,
     };
 
-    const liveSnapshot = {
-      ...createdSnapshot,
-      status: "running" as const,
-      active_stage: "retrieving_papers",
+    const liveSnapshot = makeSnapshot({
+      status: "running",
+      active_stage: "extracting",
       budget: {
-        ...createdSnapshot.budget,
-        spent_usd: 0.012,
-        remaining_usd: 0.038,
+        cap_usd: 0.1,
+        spent_usd: 0.018,
+        remaining_usd: 0.082,
+        estimated_next_step_usd: 0.004,
+        active_allocation_key: "extract:sq_0",
+        allocations: [
+          {
+            key: "decompose",
+            label: "Decompose query",
+            allocated_usd: 0.01,
+            spent_usd: 0.003,
+            remaining_usd: 0.007,
+            status: "completed",
+          },
+          {
+            key: "extract:sq_0",
+            label: "Extract findings for sq_0",
+            allocated_usd: 0.02,
+            spent_usd: 0.01,
+            remaining_usd: 0.01,
+            status: "active",
+          },
+        ],
       },
+      subquestions: [
+        { id: "sq_0", text: "What evidence survives pruning?", status: "running" },
+      ],
       graph: {
         nodes: [
-          ...createdSnapshot.graph.nodes,
+          {
+            id: "q_0",
+            label: "Fresh query",
+            type: "query",
+            status: "completed",
+            score: 1,
+            metadata: {},
+          },
           {
             id: "paper_live",
             label: "Live paper",
-            type: "paper" as const,
-            status: "active" as const,
+            type: "paper",
+            status: "active",
             score: 0.8,
-            metadata: { year: 2024 },
+            metadata: { branch: "retained", rank: 1 },
           },
         ],
-        edges: [],
+        edges: [
+          { id: "edge_live", source: "q_0", target: "paper_live", type: "retrieves", weight: 0.8 },
+        ],
       },
       events: [
         {
           id: "evt_live",
           stage: "retrieval",
-          message: "Retrieved 1 paper.",
+          message: "Pruned 2 paper branches and kept 2 for deeper reading.",
           created_at: "2026-04-05T14:00:10Z",
         },
       ],
-    };
+    });
 
     const fetchMock = vi
       .fn<typeof fetch>()
@@ -138,21 +179,13 @@ describe("App integration", () => {
 
     const user = userEvent.setup();
     const queryBox = screen.getByLabelText(/research query/i);
-    await user.clear(queryBox);
-    await user.type(
-      queryBox,
-      "How should the system handle live session updates?",
-    );
-    await user.click(
-      screen.getByRole("button", { name: /start research session/i }),
-    );
+    await user.type(queryBox, "How should the system handle live session updates?");
+    await user.click(screen.getByRole("button", { name: /run research/i }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/session",
-        expect.objectContaining({
-          method: "POST",
-        }),
+        expect.objectContaining({ method: "POST" }),
       );
     });
 
@@ -167,10 +200,10 @@ describe("App integration", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("sess_001")).toBeInTheDocument();
       expect(screen.getByText(/live paper/i)).toBeInTheDocument();
-      expect(screen.getByText(/retrieved 1 paper\./i)).toBeInTheDocument();
-      expect(screen.getByText("$0.012")).toBeInTheDocument();
+      expect(screen.getByText(/pruned 2 paper branches and kept 2 for deeper reading/i)).toBeInTheDocument();
+      expect(screen.getByText("$0.0180 spent")).toBeInTheDocument();
+      expect(screen.getByText(/extract findings for sq_0/i)).toBeInTheDocument();
     });
   });
 });

@@ -5,9 +5,9 @@
 The system uses:
 
 - a **React frontend**
-- a **FastAPI backend**
-- a **required n8n orchestration workflow**
-- a **webhook for backend session updates**
+- a **thin FastAPI backend**
+- a **required n8n research workflow**
+- a **webhook for session updates**
 - a **live stream from FastAPI to the frontend**
 
 The React app should never talk directly to workflow internals. It only talks to FastAPI.
@@ -20,6 +20,15 @@ FastAPI is responsible for:
 - accepting workflow updates through a webhook
 - pushing live updates to the React client
 
+n8n is responsible for:
+
+- decomposition
+- retrieval
+- pruning
+- extraction
+- expansion
+- synthesis
+
 For this project, a single `App.tsx` can own request submission, SSE subscription, session state, and dashboard rendering.
 
 ---
@@ -31,7 +40,7 @@ The runtime flow is:
 1. React sends a new query to FastAPI
 2. FastAPI creates a session and returns a `session_id`
 3. React opens a live stream for that session
-4. the n8n workflow sends progress updates into a FastAPI webhook
+4. the n8n workflow runs the research stages and sends progress updates into a FastAPI webhook
 5. FastAPI updates the stored session snapshot
 6. FastAPI pushes the new session state to the React frontend
 
@@ -67,7 +76,7 @@ This gives the UI live updates without making the frontend responsible for orche
 
 Creates a new research session.
 
-FastAPI should create the session record and then trigger the n8n workflow for orchestration.
+FastAPI should create the session record and then trigger the n8n workflow.
 
 #### Request body
 
@@ -258,6 +267,8 @@ The frontend does not call this endpoint.
 - `graph: GraphSnapshot`
 - `findings: FindingCard[]`
 - `final_answer: FinalAnswer | null`
+
+The final answer is delivered in `final_answer`. It should not be represented as a graph node.
 - `events: SessionEvent[]`
 - `created_at: string`
 - `updated_at: string`

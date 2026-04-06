@@ -7,11 +7,28 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class BudgetAllocation(BaseModel):
+    key: str
+    label: str
+    allocated_usd: float
+    spent_usd: float = 0.0
+    remaining_usd: float
+    status: Literal["planned", "active", "completed", "skipped", "depleted"] = "planned"
+
+
 class BudgetState(BaseModel):
     cap_usd: float
     spent_usd: float = 0.0
     remaining_usd: float
     estimated_next_step_usd: float = 0.0
+    active_allocation_key: Optional[str] = None
+    allocations: list[BudgetAllocation] = Field(default_factory=list)
+
+
+class ResearchSettings(BaseModel):
+    max_subquestions: int = 3
+    max_papers_per_subquestion: int = 3
+    max_chunks_per_paper: int = 3
 
 
 class Subquestion(BaseModel):
@@ -75,6 +92,7 @@ class SessionSnapshot(BaseModel):
     status: Literal["queued", "running", "completed", "partial", "failed"]
     active_stage: str
     budget: BudgetState
+    settings: ResearchSettings = Field(default_factory=ResearchSettings)
     subquestions: list[Subquestion] = Field(default_factory=list)
     graph: GraphSnapshot = Field(default_factory=GraphSnapshot)
     findings: list[FindingCard] = Field(default_factory=list)
@@ -111,6 +129,7 @@ class WebhookUpdateRequest(BaseModel):
     active_stage: str
     event: Optional[SessionEvent] = None
     graph_patch: Optional[GraphPatch] = None
+    subquestions: list[Subquestion] = Field(default_factory=list)
     new_findings: list[FindingCard] = Field(default_factory=list)
     budget: Optional[BudgetState] = None
     final_answer: Optional[FinalAnswer] = None

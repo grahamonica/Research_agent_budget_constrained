@@ -231,10 +231,6 @@ frontend/
 
 n8n/
   research-agent.workflow.jsonc
-
-data/
-  corpus/
-  sessions/
 ```
 ---
 

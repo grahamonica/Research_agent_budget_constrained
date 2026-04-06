@@ -1,4 +1,4 @@
-<!-- Purpose: Document the workflow that posts research progress updates into the FastAPI webhook. -->
+<!-- Purpose: Document the n8n workflow that owns the research stages and reports progress into FastAPI. -->
 
 # n8n Research Agent Workflow
 
@@ -6,18 +6,33 @@
 
 The workflow orchestrates a research session end to end:
 
-1. Receives a session trigger from FastAPI via webhook
-2. Posts a "running" status back to FastAPI immediately
-3. Calls GPT-4o to decompose the query into subquestions
-4. Posts a planning update with the subquestion graph nodes
-5. Calls GPT-4o to retrieve relevant papers from an embedded corpus and extract findings
-6. Posts a findings update with paper and finding graph nodes
-7. Calls GPT-4o to synthesize a final answer from the retained findings
-8. Posts a completion update with the final answer
+1. FastAPI creates the session and POSTs it to `n8n`
+2. `n8n` initializes workflow state
+3. `n8n` runs the research stages as workflow nodes:
+   - decompose
+   - retrieve
+   - prune
+   - extract
+   - expand
+   - synthesize
+4. each stage pushes updates into FastAPI at `/api/webhook/session-update`
+5. FastAPI stores the session snapshot and streams it to the frontend
 
-FastAPI stays the source of truth for session state. The workflow only pushes updates into the FastAPI webhook.
+FastAPI is no longer responsible for running the research logic. It only owns:
 
----
+- `POST /api/session`
+- `GET /api/session/{id}`
+- `GET /api/session/{id}/stream`
+- `POST /api/webhook/session-update`
+
+The shared stage runtime lives in:
+
+- `n8n/runtime/research_runtime.js`
+- `n8n/runtime/research_stage_runner.js`
+
+The workflow definition lives in:
+
+- `n8n/research-agent.workflow.jsonc`
 
 ## Setup
 
@@ -33,73 +48,51 @@ Default n8n runs at `http://localhost:5678`.
 
 ### 2. Set environment variables
 
-In n8n → Settings → n8n Environment Variables (or set in your shell before starting n8n):
+`n8n` needs:
 
 | Variable | Value |
 |---|---|
-| `OPEN_AI_API_KEY` | Your OpenAI API key |
-| `FASTAPI_BASE_URL` | `http://localhost:8000` (adjust for your deployment) |
-
-If running n8n in Docker and FastAPI on the host, use `http://host.docker.internal:8000` as `FASTAPI_BASE_URL`.
+| `OPEN_AI_API_KEY` | your OpenAI API key |
+| `RESEARCH_AGENT_TEST_MODE` | optional; `1` / `true` / `yes` for deterministic local test mode |
 
 ### 3. Import the workflow
 
 1. Open n8n at `http://localhost:5678`
 2. Go to **Workflows** → **Import from file**
 3. Select `n8n/research-agent.workflow.jsonc`
-4. Click **Activate** to enable the workflow
+4. Click **Activate**
 
 The webhook will be available at:
-```
+
+```text
 http://localhost:5678/webhook/research-session
 ```
 
-### 4. Configure FastAPI to point at n8n
+### 4. Point FastAPI at n8n
 
-Set the environment variable when starting FastAPI:
+Set `N8N_WEBHOOK_URL` for the backend:
 
 ```bash
 N8N_WEBHOOK_URL=http://localhost:5678/webhook/research-session \
-FASTAPI_BASE_URL=http://localhost:8000 \
-OPEN_AI_API_KEY=sk-... \
 uvicorn backend.app:app --reload
 ```
 
----
-
-## Fallback behavior
-
-If n8n is unreachable when a session is created, FastAPI will automatically run the research pipeline locally (`backend/pipeline.py`). This uses the same OpenAI API key and the embedded corpus in `backend/retrieval.py`. All SSE updates still reach the frontend — the only difference is that n8n is not involved.
-
----
+FastAPI now includes its own webhook callback URL in the trigger payload, so `n8n` does not need a separate `FASTAPI_BASE_URL` setting.
 
 ## Workflow nodes
 
 | Node | Type | Purpose |
 |---|---|---|
-| Session Trigger | Webhook | Receives POST from FastAPI |
-| Init Session | Code | Extracts params, reads env vars |
-| Post Running | HTTP Request | Notifies FastAPI: session is running |
-| Build Decompose Request | Code | Builds OpenAI payload for query decomposition |
-| Decompose Query | HTTP Request | GPT-4o decomposes query into subquestions |
-| Parse Plan | Code | Parses subquestions, builds graph patch |
-| Post Planning Update | HTTP Request | Sends planning graph to FastAPI |
-| Build Retrieve Request | Code | Builds OpenAI payload with corpus context |
-| Retrieve and Extract | HTTP Request | GPT-4o retrieves papers and extracts findings |
-| Parse Findings | Code | Parses findings, builds graph patch |
-| Post Findings Update | HTTP Request | Sends findings graph to FastAPI |
-| Build Synthesize Request | Code | Builds OpenAI payload with findings |
-| Synthesize | HTTP Request | GPT-4o synthesizes final answer |
-| Parse and Post Completion | Code | Parses answer, posts completion to FastAPI |
+| Session Trigger | Webhook | Receives the session payload from FastAPI |
+| Initialize Session State | Code | Builds the workflow state object passed between nodes |
+| Decompose Query | Execute Command | Runs the decomposition stage |
+| Retrieve Main Papers | Execute Command | Runs retrieval for initial subquestions |
+| Prune Main Papers | Execute Command | Applies the current pruning rules to initial retrieval branches |
+| Extract Main Findings | Execute Command | Extracts retained findings for initial subquestions |
+| Plan Expansion | Execute Command | Decides whether to expand and creates follow-up subquestions |
+| Retrieve Expansion Papers | Execute Command | Runs retrieval for expansion subquestions |
+| Prune Expansion Papers | Execute Command | Applies pruning to expansion retrieval branches |
+| Extract Expansion Findings | Execute Command | Extracts retained findings for expansion subquestions |
+| Synthesize Final Answer | Execute Command | Produces the final answer and posts completion |
 
----
-
-## Budget
-
-Each session uses approximately:
-
-- Decompose: ~$0.002 (GPT-4o, ~300 input / 200 output tokens)
-- Retrieve+Extract: ~$0.008 (GPT-4o, ~1200 input / 600 output tokens)
-- Synthesize: ~$0.005 (GPT-4o, ~800 input / 400 output tokens)
-
-Total: ~$0.015 per session, well within the default $0.05 cap.
+The small parse nodes between the command nodes only decode stdout back into workflow state for the next step.
