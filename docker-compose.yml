@@ -10,9 +10,6 @@ services:
       OPEN_AI_API_KEY: ${OPEN_AI_API_KEY:-}
       N8N_WEBHOOK_URL: http://n8n:5678/webhook/research-session
       FASTAPI_BASE_URL: http://backend:8000
-      NEO4J_URI: ${NEO4J_URI:-}
-      NEO4J_USERNAME: ${NEO4J_USERNAME:-712b406a}
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-}
     volumes:
       - ./backend:/app/backend
     depends_on:

@@ -20,7 +20,6 @@ backend/
   budget.py
   memory.py
   models.py
-  neo4j_store.py
   pipeline.py
   retrieval.py
   streaming.py
@@ -58,6 +57,24 @@ The UI shows the run as it progresses from planning to retrieval to retained fin
 
 Install dependencies, start the backend and frontend, and optionally import the n8n workflow if you want the full orchestration path.
 
+Create a `.env` file in the repo root with placeholders like:
+
+```env
+OPEN_AI_API_KEY=your_openai_api_key_here
+N8N_WEBHOOK_URL=http://localhost:5678/webhook/research-session
+FASTAPI_BASE_URL=http://localhost:8000
+
+# Optional
+RESEARCH_AGENT_TEST_MODE=false
+```
+
+Notes:
+
+- `OPEN_AI_API_KEY` is required for live retrieval and synthesis.
+- `N8N_WEBHOOK_URL` tells the backend where to trigger the workflow.
+- `FASTAPI_BASE_URL` is used so n8n can post progress updates back to FastAPI.
+- `RESEARCH_AGENT_TEST_MODE` is optional and is mainly useful for deterministic local testing.
+
 Typical local flow:
 
 1. Install Python requirements from `requirements.txt`.
@@ -67,4 +84,3 @@ Typical local flow:
 5. Open the app in the browser, submit a query, and watch the live graph update.
 
 If you are wiring up n8n, use [n8n/README.md](./n8n/README.md). If you want to understand the intended behavior and tradeoffs before changing the system, read [evaluation.md](./evaluation.md).
-

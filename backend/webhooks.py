@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .models import SessionSnapshot, SessionUpdateEvent, WebhookUpdateRequest
-from .neo4j_store import sync_graph_patch
 from .streaming import stream_manager
 
 
@@ -49,8 +48,6 @@ async def apply_webhook_update(
             if edge.id not in existing_edge_ids:
                 snap.graph.edges.append(edge)
                 existing_edge_ids.add(edge.id)
-
-        await sync_graph_patch(req.session_id, req.graph_patch.nodes, req.graph_patch.edges)
 
     existing_finding_ids = {f.id for f in snap.findings}
     for finding in req.new_findings:
